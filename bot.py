@@ -119,19 +119,20 @@ def do_login(session, soup, username, password, captcha_text):
         log.info(f"Login → status={r.status_code} url={r.url}")
         log.info(f"Response preview: {r.text[:500]}")
 
+        log.info(f"Login POST url={r.url}")
+        log.info(f"Login POST body={r.text[:1000]}")
+
+        # STRICT check: only trust a URL change to StudeHome
         if "StudeHome" in r.url:
             return True, None
-        if "StudeHome.aspx" in r.text:
-            return True, None
-        if "log out" in r.text.lower() or "logout" in r.text.lower():
-            return True, None
-        if "invalid" in r.text.lower() or "incorrect" in r.text.lower():
-            return False, "Invalid username or password."
+
+        # Still on Default.aspx = login failed
         if "Default.aspx" in r.url:
-            log.warning(f"Still on login page. Response: {r.text[:800]}")
-            return False, "Still on login page — check credentials."
-        log.info("Login state ambiguous — assuming success")
-        return True, None
+            return False, "Wrong username or password."
+
+        # Fallback: unknown redirect
+        log.warning(f"Unknown redirect after login: {r.url}")
+        return False, f"Unexpected page after login: {r.url}"
 
     except Exception as e:
         return False, str(e)
@@ -139,6 +140,7 @@ def do_login(session, soup, username, password, captcha_text):
 
 def fetch_attendance(session):
     try:
+        # Step 1: Try JSON API
         r = session.post(
             f"{ERP_BASE}/StudeHome.aspx/ShowAttPer",
             headers={
@@ -148,15 +150,32 @@ def fetch_attendance(session):
             json={},
             timeout=10
         )
-        log.info(f"ShowAttPer → {r.status_code} | {r.text[:300]}")
-        data = r.json()
+        log.info(f"ShowAttPer status={r.status_code}")
+        log.info(f"ShowAttPer body={r.text[:500]}")
 
-        if "d" in data and data["d"] and data["d"] != "0.00":
-            return {"overall": data["d"]}, None
+        try:
+            data = r.json()
+            if "d" in data and data["d"] and data["d"] != "0.00":
+                return {"overall": data["d"]}, None
+        except Exception:
+            log.warning("ShowAttPer not JSON")
 
-        # Fallback: scrape the dashboard page
+        # Step 2: Load dashboard and log structure
         r2 = session.get(f"{ERP_BASE}/StudeHome.aspx", timeout=10)
+        log.info(f"StudeHome status={r2.status_code} url={r2.url}")
+        log.info(f"StudeHome body={r2.text[:2000]}")
+
         soup = BeautifulSoup(r2.text, "html.parser")
+        tables = soup.find_all("table")
+        log.info(f"Tables found: {len(tables)}")
+        for i, t in enumerate(tables):
+            rows = t.find_all("tr")
+            log.info(f"  Table {i}: {len(rows)} rows")
+            for row in rows[:3]:
+                cols = [td.get_text(strip=True) for td in row.find_all("td")]
+                if cols:
+                    log.info(f"    Row: {cols}")
+
         rows = scrape_attendance_table(soup)
         if rows:
             return rows, None
@@ -164,6 +183,7 @@ def fetch_attendance(session):
         return None, "ERP returned empty data"
 
     except Exception as e:
+        log.error(f"fetch_attendance error: {e}")
         return None, str(e)
 
 
