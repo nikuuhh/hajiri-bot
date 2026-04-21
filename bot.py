@@ -21,11 +21,11 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ERP_BASE  = "https://erp.sgtu.in"
+ERP_BASE = "https://erp.sgtu.in"
 
 USERNAME, PASSWORD, CAPTCHA = range(3)
-sessions = {}
 
+sessions = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ERP
@@ -44,7 +44,6 @@ def get_login_page():
     except Exception as e:
         return None, None, None, str(e)
 
-
 def extract_aspnet_fields(soup):
     fields = {}
     for tag in soup.find_all("input", type="hidden"):
@@ -52,67 +51,31 @@ def extract_aspnet_fields(soup):
             fields[tag["name"]] = tag.get("value", "")
     return fields
 
-
 def extract_captcha_from_html(soup, raw_html):
     """
-    The SGT ERP captcha is plain styled text in the HTML — not an image.
-    From screenshot: numbers like '6 1 8 6' displayed next to a refresh icon.
-    We try multiple strategies to extract it.
+    SGT ERP captcha is JS-rendered — requests can't auto-extract it reliably.
+    Only trust hdncaptcha if it contains a short numeric value, otherwise ask user.
     """
-
-    # Strategy 1: hdncaptcha hidden field may already contain the value
     cap_field = soup.find("input", {"name": "hdncaptcha"})
     if cap_field:
         val = cap_field.get("value", "").strip()
-        if val and val.isdigit():
+        if val and val.isdigit() and 3 <= len(val) <= 6:
             log.info(f"Captcha from hdncaptcha field: {val}")
             return val
 
-    # Strategy 2: Look for a label/span/div with short numeric text
-    for tag in soup.find_all(["label", "span", "div", "td", "p", "h4", "h5", "strong", "b"]):
-        text = tag.get_text(strip=True).replace(" ", "")
-        if text.isdigit() and 3 <= len(text) <= 8:
-            log.info(f"Captcha from <{tag.name}> id={tag.get('id')}: {text}")
-            return text
-
-    # Strategy 3: Scan raw HTML for patterns like value="1234" near captcha
-    import re
-    # Find captcha-related section and grab nearby numbers
-    lower = raw_html.lower()
-    cap_idx = lower.find("captcha")
-    if cap_idx > 0:
-        chunk = raw_html[max(0, cap_idx-300):cap_idx+500]
-        log.info(f"HTML around 'captcha': {chunk}")
-        # Look for 4-digit number in that chunk
-        matches = re.findall(r'\b(\d{4,6})\b', chunk)
-        if matches:
-            log.info(f"Captcha candidates near 'captcha' keyword: {matches}")
-            return matches[0]
-
-    # Strategy 4: Any 4-digit number in the whole page
-    matches = re.findall(r'\b(\d{4})\b', raw_html)
-    # Filter out years and common numbers
-    candidates = [m for m in matches if not m.startswith("20") and m not in ["1000","2000","9999"]]
-    if candidates:
-        log.info(f"Fallback captcha candidates: {candidates[:5]}")
-        # Return most frequent one (likely the captcha repeated in hidden field)
-        from collections import Counter
-        most_common = Counter(candidates).most_common(1)[0][0]
-        return most_common
-
-    log.warning("Could not extract captcha from HTML")
+    log.info("Could not reliably extract captcha — asking user")
     return None
-
 
 def do_login(session, soup, username, password, captcha_text):
     fields = extract_aspnet_fields(soup)
 
     fields["hdnusername"] = username
     fields["hdnpassword"] = password
+
     if captcha_text:
         fields["hdncaptcha"] = captcha_text
 
-    # Set visible inputs dynamically
+    # Also fill any visible text/password inputs by name pattern
     for tag in soup.find_all("input"):
         itype = (tag.get("type") or "text").lower()
         if itype not in ["text", "password", "email"]:
@@ -129,7 +92,7 @@ def do_login(session, soup, username, password, captcha_text):
             if captcha_text:
                 fields[name] = captcha_text
 
-    fields["__EVENTTARGET"]   = ""
+    fields["__EVENTTARGET"] = ""
     fields["__EVENTARGUMENT"] = ""
 
     btn = soup.find("input", {"type": "submit"}) or soup.find("button", {"type": "submit"})
@@ -147,20 +110,20 @@ def do_login(session, soup, username, password, captcha_text):
             allow_redirects=True
         )
         log.info(f"Login → status={r.status_code} url={r.url}")
-        log.info(f"Login response: {r.text[:600]}")
+        log.info(f"Login response preview: {r.text[:600]}")
 
         if "StudeHome" in r.url:
             return True, None
         if "Default.aspx" in r.url:
-            return False, "Wrong credentials or captcha."
+            return False, "Wrong credentials or captcha. Try /login again."
         return False, f"Unexpected redirect: {r.url}"
 
     except Exception as e:
         return False, str(e)
 
-
 def fetch_attendance(session):
     try:
+        # Try the JSON API endpoint first
         r = session.post(
             f"{ERP_BASE}/StudeHome.aspx/ShowAttPer",
             headers={
@@ -179,13 +142,15 @@ def fetch_attendance(session):
         except Exception:
             log.warning("ShowAttPer not JSON")
 
+        # Fall back to scraping the dashboard page
         r2 = session.get(f"{ERP_BASE}/StudeHome.aspx", timeout=10)
         log.info(f"StudeHome → {r2.status_code} | url={r2.url}")
         log.info(f"StudeHome body: {r2.text[:2000]}")
 
         soup = BeautifulSoup(r2.text, "html.parser")
         tables = soup.find_all("table")
-        log.info(f"Tables: {len(tables)}")
+        log.info(f"Tables found: {len(tables)}")
+
         for i, t in enumerate(tables):
             for row in t.find_all("tr")[:4]:
                 cols = [td.get_text(strip=True) for td in row.find_all("td")]
@@ -196,12 +161,11 @@ def fetch_attendance(session):
         if rows:
             return rows, None
 
-        return None, "ERP returned empty data"
+        return None, "ERP returned empty attendance data."
 
     except Exception as e:
-        log.error(f"fetch_attendance: {e}")
+        log.error(f"fetch_attendance error: {e}")
         return None, str(e)
-
 
 def scrape_attendance_table(soup):
     results = []
@@ -218,7 +182,6 @@ def scrape_attendance_table(soup):
                     except ValueError:
                         continue
     return results if results else None
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MOCK FALLBACK
@@ -244,6 +207,7 @@ def format_mock_attendance():
 def format_real_attendance(data):
     if isinstance(data, dict) and "overall" in data:
         return f"📋 *Attendance Report*\n\n📊 Overall: `{data['overall']}%`"
+
     if isinstance(data, list):
         lines = ["📋 *Attendance Report*\n"]
         for row in data:
@@ -252,11 +216,11 @@ def format_real_attendance(data):
             elif isinstance(row, dict):
                 pct = row.get("percent", "?")
                 emoji = "✅" if isinstance(pct, (int, float)) and pct >= 75 else "⚠️"
-                lines.append(f"{emoji} *{row.get('subject','Subject')}*")
+                lines.append(f"{emoji} *{row.get('subject', 'Subject')}*")
                 lines.append(f"   {row.get('present','?')}/{row.get('total','?')} — `{pct}%`\n")
         return "\n".join(lines)
-    return f"📋 Raw:\n`{json.dumps(data, indent=2)}`"
 
+    return f"📋 Raw:\n`{json.dumps(data, indent=2)}`"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BUNK CALCULATOR
@@ -270,7 +234,6 @@ def bunk_calc(present, total, target=75):
     else:
         needed = int(((target * total) - (100 * present)) / (100 - target)) + 1
         return percent, f"⚠️ Attend *{needed}* more class(es) to reach {target}%."
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TELEGRAM HANDLERS
@@ -314,19 +277,23 @@ async def login_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     ctx.user_data["erp_session"] = session
-    ctx.user_data["erp_soup"]    = soup
+    ctx.user_data["erp_soup"] = soup
 
-    # Try to auto-extract captcha from HTML
+    # Try to auto-extract captcha
     captcha_val = extract_captcha_from_html(soup, raw_html)
 
     if captcha_val:
         log.info(f"Auto-extracted captcha: {captcha_val}")
-        await update.message.reply_text(f"🔢 Captcha detected: `{captcha_val}`\n⏳ Logging in...", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"🔢 Captcha auto-detected: `{captcha_val}`\n⏳ Logging in...",
+            parse_mode="Markdown"
+        )
         return await _attempt_login(update, ctx, captcha_val)
     else:
-        # Could not auto-extract — ask user manually
+        # Ask user to manually enter captcha
         await update.message.reply_text(
-            "🔢 Please open https://erp.sgtu.in and type the *captcha number* shown on the login page:",
+            "🔢 Open https://erp.sgtu.in in your browser and type the *captcha number* shown on the login page:\n\n"
+            "_(Just the digits, e.g. `6186`)_",
             parse_mode="Markdown"
         )
         return CAPTCHA
@@ -337,12 +304,13 @@ async def login_captcha(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return await _attempt_login(update, ctx, captcha_text)
 
 async def _attempt_login(update, ctx, captcha_text):
-    session  = ctx.user_data.get("erp_session")
-    soup     = ctx.user_data.get("erp_soup")
+    session = ctx.user_data.get("erp_session")
+    soup    = ctx.user_data.get("erp_soup")
     username = ctx.user_data.get("username")
     password = ctx.user_data.get("password")
 
     await update.message.reply_text("⏳ Logging in...")
+
     success, err = do_login(session, soup, username, password, captcha_text)
 
     if not success:
@@ -351,7 +319,7 @@ async def _attempt_login(update, ctx, captcha_text):
 
     sessions[update.effective_user.id] = session
     await update.message.reply_text(
-        "✅ *Logged in!*\n\nUse /attendance to fetch your data.",
+        "✅ *Logged in successfully!*\n\nUse /attendance to fetch your data.",
         parse_mode="Markdown"
     )
     return ConversationHandler.END
@@ -363,17 +331,22 @@ async def login_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def attendance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     session = sessions.get(uid)
+
     if not session:
         await update.message.reply_text("⚠️ Not logged in. Use /login first, or /demo for mock data.")
         return
+
     await update.message.reply_text("⏳ Fetching attendance from ERP...")
+
     data, err = fetch_attendance(session)
+
     if err or not data:
         await update.message.reply_text(
             f"⚠️ Could not fetch real data (`{err}`)\n\n{format_mock_attendance()}",
             parse_mode="Markdown"
         )
         return
+
     await update.message.reply_text(format_real_attendance(data), parse_mode="Markdown")
 
 async def bunk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -400,7 +373,6 @@ async def logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sessions.pop(update.effective_user.id, None)
     ctx.user_data.clear()
     await update.message.reply_text("✅ Logged out.")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
