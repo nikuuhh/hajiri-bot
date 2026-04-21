@@ -1,5 +1,7 @@
-python-telegram-bot==21.5
+python-telegram-bot==21.3
 requests
 beautifulsoup4
 playwright
- 
+Pillow
+pytesseract
+cryptography
