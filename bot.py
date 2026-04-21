@@ -31,12 +31,12 @@ USERNAME, PASSWORD, CAPTCHA = range(3)
 # ── In-memory session store: { user_id: requests.Session } ───────────────────
 sessions = {}
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ERP SCRAPING
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_login_page():
-    """Fetch ERP login page and return (session, soup, error)."""
     s = requests.Session()
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -50,7 +50,6 @@ def get_login_page():
 
 
 def extract_aspnet_fields(soup):
-    """Pull hidden ASP.NET form fields from login page."""
     fields = {}
     for tag in soup.find_all("input", type="hidden"):
         if tag.get("name"):
@@ -59,72 +58,56 @@ def extract_aspnet_fields(soup):
 
 
 def get_captcha_image(session, soup):
-    """Download captcha image bytes. Returns (bytes, error)."""
-    img_tag = soup.find("img", {"id": lambda x: x and "captcha" in x.lower()})
-    if not img_tag:
-        # Try common captcha image IDs used in SGT ERP
-        for possible_id in ["imgCaptcha", "CaptchaImage", "imgcaptcha"]:
-            img_tag = soup.find("img", {"id": possible_id})
-            if img_tag:
-                break
-    if not img_tag:
-        return None, "Captcha image not found in page"
-    src = img_tag.get("src", "")
-    if not src.startswith("http"):
-        src = ERP_BASE + "/" + src.lstrip("/")
-    try:
-        r = session.get(src, timeout=10)
-        return r.content, None
-    except Exception as e:
-        return None, str(e)
+    for possible_id in ["imgCaptcha", "CaptchaImage", "imgcaptcha", "img_captcha"]:
+        img_tag = soup.find("img", {"id": possible_id})
+        if img_tag:
+            src = img_tag.get("src", "")
+            if not src.startswith("http"):
+                src = ERP_BASE + "/" + src.lstrip("/")
+            try:
+                r = session.get(src, timeout=10)
+                return r.content, None
+            except Exception as e:
+                return None, str(e)
+    return None, "Captcha image not found"
 
 
 def do_login(session, soup, username, password, captcha_text):
-    """
-    Submit login form. Returns (success: bool, error: str|None).
-    Field names confirmed from SGT ERP HTML inspection.
-    """
+    # Pull all hidden ASP.NET fields
     fields = extract_aspnet_fields(soup)
 
-    # ── Confirmed SGT ERP field names ─────────────────────────────────────────
-    # Username and password are stored in hidden fields hdnusername/hdnpassword
-    # The visible input fields use txt_userid and txt_password (or similar)
-    # We set BOTH hidden + visible fields to be safe
-
-    # Set hidden fields (confirmed present)
+    # SGT ERP confirmed hidden credential fields from live HTML inspection
     fields["hdnusername"] = username
     fields["hdnpassword"] = password
-
-    # Also try to set visible input fields dynamically
-    user_field = _find_visible_input(soup, ["txt_userid", "txtUserid", "txt_username",
-                                            "txtUsername", "txtUserName", "txt_user"])
-    pass_field = _find_visible_input(soup, ["txt_password", "txtPassword", "txt_pass",
-                                            "txtPass"])
-    cap_field  = _find_visible_input(soup, ["txt_captcha", "txtCaptcha", "txt_Captcha",
-                                            "CaptchaInput"])
-
-    if user_field:
-        fields[user_field] = username
-    if pass_field:
-        fields[pass_field] = password
-    if cap_field and captcha_text:
-        fields[cap_field] = captcha_text
-
-    # Set captcha hidden field too
     if captcha_text:
         fields["hdncaptcha"] = captcha_text
 
-    # ASP.NET requires these
+    # Also set any visible text/password inputs found dynamically
+    for tag in soup.find_all("input"):
+        itype = (tag.get("type") or "text").lower()
+        if itype not in ["text", "password", "email"]:
+            continue
+        name = tag.get("name") or tag.get("id", "")
+        if not name:
+            continue
+        nl = name.lower()
+        if any(x in nl for x in ["user", "userid", "enroll", "login"]):
+            fields[name] = username
+        elif any(x in nl for x in ["pass", "pwd", "password"]):
+            fields[name] = password
+        elif any(x in nl for x in ["captcha", "cap", "verify"]):
+            if captcha_text:
+                fields[name] = captcha_text
+
     fields["__EVENTTARGET"]   = ""
     fields["__EVENTARGUMENT"] = ""
 
-    # Find submit button
+    # Submit button
     btn = soup.find("input", {"type": "submit"}) or soup.find("button", {"type": "submit"})
     if btn and btn.get("name"):
         fields[btn["name"]] = btn.get("value", "Login")
 
-    log.info(f"Submitting login for user: {username}")
-    log.info(f"Fields being posted: {[k for k in fields.keys()]}")
+    log.info(f"Attempting login for: {username}")
 
     try:
         r = session.post(
@@ -133,47 +116,29 @@ def do_login(session, soup, username, password, captcha_text):
             timeout=15,
             allow_redirects=True
         )
-        log.info(f"Login POST → status={r.status_code} url={r.url}")
-        log.info(f"Response snippet: {r.text[:300]}")
+        log.info(f"Login → status={r.status_code} url={r.url}")
+        log.info(f"Response preview: {r.text[:500]}")
 
-        if "StudeHome" in r.url or "studhome" in r.url.lower():
+        if "StudeHome" in r.url:
             return True, None
         if "StudeHome.aspx" in r.text:
             return True, None
-        if "logout" in r.text.lower() or "log out" in r.text.lower():
+        if "log out" in r.text.lower() or "logout" in r.text.lower():
             return True, None
         if "invalid" in r.text.lower() or "incorrect" in r.text.lower():
-            return False, "Invalid username, password, or captcha."
+            return False, "Invalid username or password."
         if "Default.aspx" in r.url:
-            return False, "Still on login page — credentials may be wrong."
-        # Unknown state — store session and try anyway
+            log.warning(f"Still on login page. Response: {r.text[:800]}")
+            return False, "Still on login page — check credentials."
+        log.info("Login state ambiguous — assuming success")
         return True, None
+
     except Exception as e:
         return False, str(e)
 
 
-def _find_visible_input(soup, candidates):
-    """Find visible input field by checking id then name attributes."""
-    for name in candidates:
-        tag = soup.find("input", {"id": name})
-        if tag:
-            return tag.get("name") or tag.get("id")
-        tag = soup.find("input", {"name": name})
-        if tag:
-            return tag.get("name")
-    return None
-
-
-
-
-
 def fetch_attendance(session):
-    """
-    Call ShowAttPer endpoint with authenticated session.
-    Returns (data: dict|list, error: str|None)
-    """
     try:
-        # First try the JSON API endpoint
         r = session.post(
             f"{ERP_BASE}/StudeHome.aspx/ShowAttPer",
             headers={
@@ -183,87 +148,79 @@ def fetch_attendance(session):
             json={},
             timeout=10
         )
+        log.info(f"ShowAttPer → {r.status_code} | {r.text[:300]}")
         data = r.json()
-        log.info(f"ShowAttPer response: {data}")
 
-        # If d is a non-zero string percentage
-        if "d" in data:
-            d_val = data["d"]
-            if d_val and d_val != "0.00":
-                return {"overall": d_val}, None
+        if "d" in data and data["d"] and data["d"] != "0.00":
+            return {"overall": data["d"]}, None
 
-        # Try scraping the attendance table from the page directly
+        # Fallback: scrape the dashboard page
         r2 = session.get(f"{ERP_BASE}/StudeHome.aspx", timeout=10)
         soup = BeautifulSoup(r2.text, "html.parser")
-        attendance = scrape_attendance_table(soup)
-        if attendance:
-            return attendance, None
+        rows = scrape_attendance_table(soup)
+        if rows:
+            return rows, None
 
-        return None, "ERP returned empty attendance data."
+        return None, "ERP returned empty data"
 
     except Exception as e:
         return None, str(e)
 
 
 def scrape_attendance_table(soup):
-    """Scrape attendance from HTML table on StudeHome page."""
     results = []
-    # Look for tables containing attendance data
-    tables = soup.find_all("table")
-    for table in tables:
-        rows = table.find_all("tr")
-        for row in rows:
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr"):
             cols = [td.get_text(strip=True) for td in row.find_all("td")]
-            # Attendance rows typically have subject, present, total, percentage
             if len(cols) >= 3:
-                # Check if any column looks like a percentage
-                for i, col in enumerate(cols):
-                    if "%" in col or (col.replace(".", "").isdigit() and 0 < float(col or 0) <= 100):
-                        results.append(cols)
-                        break
+                for col in cols:
+                    try:
+                        val = float(col.replace("%", ""))
+                        if 0 < val <= 100:
+                            results.append(cols)
+                            break
+                    except ValueError:
+                        continue
     return results if results else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MOCK FALLBACK DATA
+# MOCK FALLBACK
 # ─────────────────────────────────────────────────────────────────────────────
 
 MOCK_ATTENDANCE = [
-    {"subject": "Mathematics",        "present": 38, "total": 45, "percent": 84.4},
-    {"subject": "Physics",            "present": 30, "total": 40, "percent": 75.0},
-    {"subject": "Chemistry",          "present": 35, "total": 42, "percent": 83.3},
-    {"subject": "English",            "present": 28, "total": 38, "percent": 73.7},
-    {"subject": "Computer Science",   "present": 42, "total": 46, "percent": 91.3},
+    {"subject": "Mathematics",      "present": 38, "total": 45, "percent": 84.4},
+    {"subject": "Physics",          "present": 30, "total": 40, "percent": 75.0},
+    {"subject": "Chemistry",        "present": 35, "total": 42, "percent": 83.3},
+    {"subject": "English",          "present": 28, "total": 38, "percent": 73.7},
+    {"subject": "Computer Science", "present": 42, "total": 46, "percent": 91.3},
 ]
 
-def format_mock_attendance(name="Student"):
-    lines = [f"📋 *Attendance Report* (Demo)\n👤 {name}\n"]
+def format_mock_attendance():
+    lines = ["📋 *Attendance Report* (Demo Data)\n"]
     for s in MOCK_ATTENDANCE:
         emoji = "✅" if s["percent"] >= 75 else "⚠️"
         lines.append(f"{emoji} *{s['subject']}*")
-        lines.append(f"   {s['present']}/{s['total']} — `{s['percent']}%`")
-    lines.append("\n_⚠️ This is demo data. Real ERP login coming soon._")
+        lines.append(f"   {s['present']}/{s['total']} — `{s['percent']}%`\n")
+    lines.append("_⚠️ This is demo data. Use /login for real data._")
     return "\n".join(lines)
 
 
 def format_real_attendance(data):
-    """Format real ERP attendance data for Telegram."""
     if isinstance(data, dict) and "overall" in data:
         return f"📋 *Attendance Report*\n\n📊 Overall: `{data['overall']}%`"
-
     if isinstance(data, list):
         lines = ["📋 *Attendance Report*\n"]
         for row in data:
-            if isinstance(row, dict):
+            if isinstance(row, list) and len(row) >= 3:
+                lines.append(f"• {' | '.join(str(c) for c in row)}")
+            elif isinstance(row, dict):
                 pct = row.get("percent", "?")
                 emoji = "✅" if isinstance(pct, (int, float)) and pct >= 75 else "⚠️"
                 lines.append(f"{emoji} *{row.get('subject','Subject')}*")
-                lines.append(f"   {row.get('present','?')}/{row.get('total','?')} — `{pct}%`")
-            elif isinstance(row, list) and len(row) >= 3:
-                lines.append(f"• {' | '.join(str(c) for c in row)}")
+                lines.append(f"   {row.get('present','?')}/{row.get('total','?')} — `{pct}%`\n")
         return "\n".join(lines)
-
-    return f"📋 Attendance data:\n```{json.dumps(data, indent=2)}```"
+    return f"📋 Raw data:\n`{json.dumps(data, indent=2)}`"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -273,14 +230,9 @@ def format_real_attendance(data):
 def bunk_calc(present, total, target=75):
     percent = (present / total * 100) if total else 0
     if percent >= target:
-        # How many can we bunk?
-        # (present) / (total + x) >= target/100  →  x <= present*100/target - total
         can_bunk = int((present * 100 / target) - total)
         return percent, f"✅ You can bunk *{can_bunk}* more class(es) and stay above {target}%."
     else:
-        # How many to attend?
-        # (present + x) / (total + x) >= target/100
-        # x >= (target*total - 100*present) / (100 - target)
         needed = int(((target * total) - (100 * present)) / (100 - target)) + 1
         return percent, f"⚠️ Attend *{needed}* more class(es) to reach {target}%."
 
@@ -296,21 +248,14 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "• /login — Login with ERP credentials\n"
         "• /attendance — View your attendance\n"
-        "• /bunk — Bunk calculator\n"
+        "• /bunk <present> <total> — Bunk calculator\n"
         "• /logout — Clear your session\n"
         "• /demo — See demo attendance",
         parse_mode="Markdown"
     )
 
-
 async def demo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        format_mock_attendance(),
-        parse_mode="Markdown"
-    )
-
-
-# ── Login flow ────────────────────────────────────────────────────────────────
+    await update.message.reply_text(format_mock_attendance(), parse_mode="Markdown")
 
 async def login_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -320,17 +265,14 @@ async def login_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     return USERNAME
 
-
 async def login_username(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["username"] = update.message.text.strip()
     await update.message.reply_text("🔑 Enter your *password*:", parse_mode="Markdown")
     return PASSWORD
 
-
 async def login_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["password"] = update.message.text.strip()
-
-    await update.message.reply_text("⏳ Fetching captcha from ERP...")
+    await update.message.reply_text("⏳ Connecting to ERP...")
 
     session, soup, err = get_login_page()
     if err:
@@ -343,15 +285,11 @@ async def login_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["erp_session"] = session
     ctx.user_data["erp_soup"]    = soup
 
-    # Try to get captcha
     cap_bytes, cap_err = get_captcha_image(session, soup)
-
     if cap_err or not cap_bytes:
-        # No captcha found — try logging in directly
-        await update.message.reply_text("🔄 No captcha detected, attempting login...")
+        await update.message.reply_text("🔄 No captcha required, logging in...")
         return await _attempt_login(update, ctx, captcha_text="")
 
-    # Send captcha image to user
     await update.message.reply_photo(
         photo=cap_bytes,
         caption="🔢 Enter the *captcha* shown above:",
@@ -359,11 +297,8 @@ async def login_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     return CAPTCHA
 
-
 async def login_captcha(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    captcha_text = update.message.text.strip()
-    return await _attempt_login(update, ctx, captcha_text)
-
+    return await _attempt_login(update, ctx, update.message.text.strip())
 
 async def _attempt_login(update, ctx, captcha_text):
     session  = ctx.user_data.get("erp_session")
@@ -372,67 +307,49 @@ async def _attempt_login(update, ctx, captcha_text):
     password = ctx.user_data.get("password")
 
     await update.message.reply_text("⏳ Logging in...")
-
     success, err = do_login(session, soup, username, password, captcha_text)
 
     if not success:
-        await update.message.reply_text(
-            f"❌ Login failed: {err}\n\nTry /login again or use /demo.",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(f"❌ Login failed: {err}\n\nTry /login again or use /demo.")
         return ConversationHandler.END
 
-    # Store session keyed by Telegram user ID
     sessions[update.effective_user.id] = session
     await update.message.reply_text(
-        "✅ *Logged in successfully!*\n\nUse /attendance to fetch your data.",
+        "✅ *Logged in!*\n\nUse /attendance to fetch your data.",
         parse_mode="Markdown"
     )
     return ConversationHandler.END
 
-
 async def login_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Login cancelled.", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("❌ Cancelled.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
-
-
-# ── Attendance ────────────────────────────────────────────────────────────────
 
 async def attendance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     session = sessions.get(uid)
 
     if not session:
-        await update.message.reply_text(
-            "⚠️ You're not logged in.\n\nUse /login to login, or /demo for mock data."
-        )
+        await update.message.reply_text("⚠️ Not logged in. Use /login first, or /demo for mock data.")
         return
 
     await update.message.reply_text("⏳ Fetching attendance from ERP...")
     data, err = fetch_attendance(session)
 
     if err or not data:
-        log.warning(f"Attendance fetch failed: {err} — falling back to mock")
+        log.warning(f"Attendance fetch failed: {err} — showing mock")
         await update.message.reply_text(
-            f"⚠️ Could not fetch real data (`{err}`)\n\n"
-            "Showing demo data instead:\n\n" + format_mock_attendance(),
+            f"⚠️ Could not fetch real data (`{err}`)\n\nShowing demo data:\n\n{format_mock_attendance()}",
             parse_mode="Markdown"
         )
         return
 
     await update.message.reply_text(format_real_attendance(data), parse_mode="Markdown")
 
-
-# ── Bunk calculator ───────────────────────────────────────────────────────────
-
 async def bunk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
     if len(args) < 2:
         await update.message.reply_text(
-            "📐 *Bunk Calculator*\n\n"
-            "Usage: `/bunk <present> <total>`\n"
-            "Example: `/bunk 35 45`\n\n"
-            "Optional target: `/bunk 35 45 80`",
+            "📐 *Bunk Calculator*\n\nUsage: `/bunk <present> <total>`\nExample: `/bunk 35 45`",
             parse_mode="Markdown"
         )
         return
@@ -442,20 +359,14 @@ async def bunk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         target  = int(args[2]) if len(args) > 2 else 75
         pct, msg = bunk_calc(present, total, target)
         await update.message.reply_text(
-            f"📐 *Bunk Calculator*\n\n"
-            f"Present: `{present}/{total}` → `{pct:.1f}%`\n\n{msg}",
+            f"📐 *Bunk Calculator*\n\nPresent: `{present}/{total}` → `{pct:.1f}%`\n\n{msg}",
             parse_mode="Markdown"
         )
     except ValueError:
-        await update.message.reply_text("❌ Use numbers only. Example: `/bunk 35 45`", parse_mode="Markdown")
-
-
-# ── Logout ────────────────────────────────────────────────────────────────────
+        await update.message.reply_text("❌ Numbers only. Example: `/bunk 35 45`", parse_mode="Markdown")
 
 async def logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid in sessions:
-        del sessions[uid]
+    sessions.pop(update.effective_user.id, None)
     ctx.user_data.clear()
     await update.message.reply_text("✅ Logged out. Use /login to login again.")
 
