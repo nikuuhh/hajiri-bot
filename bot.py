@@ -82,32 +82,49 @@ def get_captcha_image(session, soup):
 def do_login(session, soup, username, password, captcha_text):
     """
     Submit login form. Returns (success: bool, error: str|None).
-    SGT ERP uses plain password (no RSA observed in form POST — 
-    RSA may be JS-only client side validation, actual POST is plaintext).
+    Field names confirmed from SGT ERP HTML inspection.
     """
     fields = extract_aspnet_fields(soup)
 
-    # Find username / password / captcha field names dynamically
-    user_field = _find_field(soup, ["txtUserName", "txtUsername", "UserName", "username"])
-    pass_field = _find_field(soup, ["txtPassword", "Password", "password", "txtPass"])
-    cap_field  = _find_field(soup, ["txtCaptcha", "CaptchaInput", "captcha", "txtcaptcha"])
+    # ── Confirmed SGT ERP field names ─────────────────────────────────────────
+    # Username and password are stored in hidden fields hdnusername/hdnpassword
+    # The visible input fields use txt_userid and txt_password (or similar)
+    # We set BOTH hidden + visible fields to be safe
 
-    if not user_field or not pass_field:
-        return False, f"Could not find login fields. Found fields: {list(fields.keys())}"
+    # Set hidden fields (confirmed present)
+    fields["hdnusername"] = username
+    fields["hdnpassword"] = password
 
-    fields[user_field] = username
-    fields[pass_field] = password
+    # Also try to set visible input fields dynamically
+    user_field = _find_visible_input(soup, ["txt_userid", "txtUserid", "txt_username",
+                                            "txtUsername", "txtUserName", "txt_user"])
+    pass_field = _find_visible_input(soup, ["txt_password", "txtPassword", "txt_pass",
+                                            "txtPass"])
+    cap_field  = _find_visible_input(soup, ["txt_captcha", "txtCaptcha", "txt_Captcha",
+                                            "CaptchaInput"])
+
+    if user_field:
+        fields[user_field] = username
+    if pass_field:
+        fields[pass_field] = password
     if cap_field and captcha_text:
         fields[cap_field] = captcha_text
 
-    # ASP.NET requires this
-    fields["__EVENTTARGET"]   = fields.get("__EVENTTARGET", "")
-    fields["__EVENTARGUMENT"] = fields.get("__EVENTARGUMENT", "")
+    # Set captcha hidden field too
+    if captcha_text:
+        fields["hdncaptcha"] = captcha_text
+
+    # ASP.NET requires these
+    fields["__EVENTTARGET"]   = ""
+    fields["__EVENTARGUMENT"] = ""
 
     # Find submit button
     btn = soup.find("input", {"type": "submit"}) or soup.find("button", {"type": "submit"})
     if btn and btn.get("name"):
         fields[btn["name"]] = btn.get("value", "Login")
+
+    log.info(f"Submitting login for user: {username}")
+    log.info(f"Fields being posted: {[k for k in fields.keys()]}")
 
     try:
         r = session.post(
@@ -116,27 +133,38 @@ def do_login(session, soup, username, password, captcha_text):
             timeout=15,
             allow_redirects=True
         )
-        # If login succeeded, we should NOT be on Default.aspx anymore
-        # or the page should contain student name / dashboard content
+        log.info(f"Login POST → status={r.status_code} url={r.url}")
+        log.info(f"Response snippet: {r.text[:300]}")
+
         if "StudeHome" in r.url or "studhome" in r.url.lower():
             return True, None
-        if "logout" in r.text.lower() or "welcome" in r.text.lower():
+        if "StudeHome.aspx" in r.text:
+            return True, None
+        if "logout" in r.text.lower() or "log out" in r.text.lower():
             return True, None
         if "invalid" in r.text.lower() or "incorrect" in r.text.lower():
             return False, "Invalid username, password, or captcha."
-        # Ambiguous — store session anyway and try fetching attendance
+        if "Default.aspx" in r.url:
+            return False, "Still on login page — credentials may be wrong."
+        # Unknown state — store session and try anyway
         return True, None
     except Exception as e:
         return False, str(e)
 
 
-def _find_field(soup, candidates):
-    """Find first matching input field name from candidates list."""
+def _find_visible_input(soup, candidates):
+    """Find visible input field by checking id then name attributes."""
     for name in candidates:
-        tag = soup.find("input", {"id": name}) or soup.find("input", {"name": name})
+        tag = soup.find("input", {"id": name})
         if tag:
             return tag.get("name") or tag.get("id")
+        tag = soup.find("input", {"name": name})
+        if tag:
+            return tag.get("name")
     return None
+
+
+
 
 
 def fetch_attendance(session):
