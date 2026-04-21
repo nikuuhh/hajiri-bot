@@ -1,6 +1,6 @@
 """
 Hajiri Bot — SGT University Attendance Bot
-Real ERP scraping with mock fallback.
+Uses Playwright (headless Chromium) for automated ERP login + captcha.
 """
 
 import os
@@ -21,110 +21,176 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ERP_BASE = "https://erp.sgtu.in"
+ERP_BASE  = "https://erp.sgtu.in"
 
-USERNAME, PASSWORD, CAPTCHA = range(3)
+USERNAME, PASSWORD = range(2)
 
-sessions = {}
+# cookies stored per Telegram user ID
+user_cookies = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ERP
+# ERP LOGIN — Playwright headless browser
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_login_page():
+async def erp_login(username, password):
+    """
+    Launches headless Chromium, opens ERP login page,
+    reads the JS-rendered captcha directly from the DOM,
+    fills all fields and submits.
+    Returns (cookie_dict, error) tuple.
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return None, "Playwright not installed. Check requirements.txt."
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                ]
+            )
+            context = await browser.new_context()
+            page    = await context.new_page()
+
+            log.info("Opening ERP login page...")
+            await page.goto(f"{ERP_BASE}/Default.aspx", wait_until="networkidle", timeout=30000)
+
+            # Give JS time to render captcha
+            await page.wait_for_timeout(2000)
+
+            # ── Step 1: Extract captcha from DOM ────────────────────────────
+            captcha_text = None
+
+            # Try known element selectors first
+            for sel in [
+                "#lblCaptcha", "#CaptchaLabel", "#lbl_captcha",
+                "span[id*='aptcha']", "label[id*='aptcha']",
+                "div[id*='aptcha']", ".captcha",
+            ]:
+                try:
+                    el = await page.query_selector(sel)
+                    if el:
+                        t = (await el.inner_text()).strip().replace(" ", "")
+                        if t.isdigit() and 3 <= len(t) <= 8:
+                            captcha_text = t
+                            log.info(f"Captcha via selector '{sel}': {captcha_text}")
+                            break
+                except Exception:
+                    continue
+
+            # Full DOM scan — find any element whose text is purely 4-6 digits
+            if not captcha_text:
+                candidates = await page.evaluate("""() => {
+                    const found = [];
+                    document.querySelectorAll('*').forEach(el => {
+                        const raw   = (el.innerText || el.textContent || '').trim();
+                        const clean = raw.replace(/\\s+/g, '');
+                        if (/^\\d{4,6}$/.test(clean)) {
+                            found.push({ tag: el.tagName, id: el.id, cls: el.className, text: clean });
+                        }
+                    });
+                    return found;
+                }""")
+                log.info(f"DOM numeric candidates: {candidates}")
+
+                SKIP = {"2025", "2026", "2024", "8080", "4000", "3000", "1433", "1234", "0000"}
+                for item in candidates:
+                    if item["text"] not in SKIP and not item["text"].startswith("20"):
+                        captcha_text = item["text"]
+                        log.info(f"Captcha from DOM scan: {captcha_text} (id={item['id']})")
+                        break
+
+            # Read hidden field value via JS as last resort
+            if not captcha_text:
+                val = await page.evaluate(
+                    "() => { const e = document.querySelector('input[name=\"hdncaptcha\"]'); return e ? e.value : ''; }"
+                )
+                val = val.strip()
+                if val.isdigit() and 3 <= len(val) <= 8:
+                    captcha_text = val
+                    log.info(f"Captcha from hdncaptcha JS: {captcha_text}")
+
+            if not captcha_text:
+                await page.screenshot(path="/tmp/erp_debug.png")
+                log.error("Could not find captcha. Screenshot saved.")
+                await browser.close()
+                return None, "Could not read captcha from ERP page."
+
+            log.info(f"Captcha to use: {captcha_text}")
+
+            # ── Step 2: Fill credentials + captcha via JS ────────────────────
+            await page.evaluate(f"""() => {{
+                const setVal = (name, val) => {{
+                    const e = document.querySelector('input[name="' + name + '"]');
+                    if (e) e.value = val;
+                }};
+                setVal('hdnusername', '{username}');
+                setVal('hdnpassword', '{password}');
+                setVal('hdncaptcha',  '{captcha_text}');
+
+                document.querySelectorAll('input[type="text"], input[type="password"]').forEach(el => {{
+                    const n = (el.name || el.id || '').toLowerCase();
+                    if (n.includes('user') || n.includes('enroll')) el.value = '{username}';
+                    if (n.includes('pass') || n.includes('pwd'))    el.value = '{password}';
+                    if (n.includes('captcha') || n.includes('cap')) el.value = '{captcha_text}';
+                }});
+            }}""")
+
+            # ── Step 3: Click submit ─────────────────────────────────────────
+            btn = (
+                await page.query_selector("input[type='submit']") or
+                await page.query_selector("button[type='submit']") or
+                await page.query_selector("button")
+            )
+            if btn:
+                await btn.click()
+            else:
+                await page.keyboard.press("Enter")
+
+            await page.wait_for_load_state("networkidle", timeout=15000)
+
+            final_url = page.url
+            log.info(f"Post-login URL: {final_url}")
+
+            # ── Step 4: Check success ────────────────────────────────────────
+            if "StudeHome" in final_url:
+                cookies     = await context.cookies()
+                cookie_dict = {c["name"]: c["value"] for c in cookies}
+                log.info(f"Login OK. Cookies: {list(cookie_dict.keys())}")
+                await browser.close()
+                return cookie_dict, None
+            else:
+                body = await page.inner_text("body")
+                log.info(f"Login failed body: {body[:400]}")
+                await browser.close()
+                return None, "Login failed — wrong credentials or captcha mismatch."
+
+    except Exception as e:
+        log.error(f"erp_login error: {e}")
+        return None, str(e)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ATTENDANCE FETCH — uses saved cookies
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_attendance(cookie_dict):
     s = requests.Session()
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     })
-    try:
-        r = s.get(f"{ERP_BASE}/Default.aspx", timeout=10)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        return s, soup, r.text, None
-    except Exception as e:
-        return None, None, None, str(e)
-
-def extract_aspnet_fields(soup):
-    fields = {}
-    for tag in soup.find_all("input", type="hidden"):
-        if tag.get("name"):
-            fields[tag["name"]] = tag.get("value", "")
-    return fields
-
-def extract_captcha_from_html(soup, raw_html):
-    """
-    SGT ERP captcha is JS-rendered — requests can't auto-extract it reliably.
-    Only trust hdncaptcha if it contains a short numeric value, otherwise ask user.
-    """
-    cap_field = soup.find("input", {"name": "hdncaptcha"})
-    if cap_field:
-        val = cap_field.get("value", "").strip()
-        if val and val.isdigit() and 3 <= len(val) <= 6:
-            log.info(f"Captcha from hdncaptcha field: {val}")
-            return val
-
-    log.info("Could not reliably extract captcha — asking user")
-    return None
-
-def do_login(session, soup, username, password, captcha_text):
-    fields = extract_aspnet_fields(soup)
-
-    fields["hdnusername"] = username
-    fields["hdnpassword"] = password
-
-    if captcha_text:
-        fields["hdncaptcha"] = captcha_text
-
-    # Also fill any visible text/password inputs by name pattern
-    for tag in soup.find_all("input"):
-        itype = (tag.get("type") or "text").lower()
-        if itype not in ["text", "password", "email"]:
-            continue
-        name = tag.get("name") or tag.get("id", "")
-        if not name:
-            continue
-        nl = name.lower()
-        if any(x in nl for x in ["user", "userid", "enroll", "login"]):
-            fields[name] = username
-        elif any(x in nl for x in ["pass", "pwd", "password"]):
-            fields[name] = password
-        elif any(x in nl for x in ["captcha", "cap", "verify", "code"]):
-            if captcha_text:
-                fields[name] = captcha_text
-
-    fields["__EVENTTARGET"] = ""
-    fields["__EVENTARGUMENT"] = ""
-
-    btn = soup.find("input", {"type": "submit"}) or soup.find("button", {"type": "submit"})
-    if btn and btn.get("name"):
-        fields[btn["name"]] = btn.get("value", "Login")
-
-    safe = {k: v for k, v in fields.items() if "STATE" not in k.upper()}
-    log.info(f"POSTing: {safe}")
+    for name, value in cookie_dict.items():
+        s.cookies.set(name, value, domain="erp.sgtu.in")
 
     try:
-        r = session.post(
-            f"{ERP_BASE}/Default.aspx",
-            data=fields,
-            timeout=15,
-            allow_redirects=True
-        )
-        log.info(f"Login → status={r.status_code} url={r.url}")
-        log.info(f"Login response preview: {r.text[:600]}")
-
-        if "StudeHome" in r.url:
-            return True, None
-        if "Default.aspx" in r.url:
-            return False, "Wrong credentials or captcha. Try /login again."
-        return False, f"Unexpected redirect: {r.url}"
-
-    except Exception as e:
-        return False, str(e)
-
-def fetch_attendance(session):
-    try:
-        # Try the JSON API endpoint first
-        r = session.post(
+        # Try JSON API first
+        r = s.post(
             f"{ERP_BASE}/StudeHome.aspx/ShowAttPer",
             headers={
                 "Content-Type": "application/json",
@@ -140,18 +206,18 @@ def fetch_attendance(session):
             if "d" in data and data["d"] and data["d"] != "0.00":
                 return {"overall": data["d"]}, None
         except Exception:
-            log.warning("ShowAttPer not JSON")
+            pass
 
-        # Fall back to scraping the dashboard page
-        r2 = session.get(f"{ERP_BASE}/StudeHome.aspx", timeout=10)
+        # Fall back to scraping the dashboard HTML
+        r2 = s.get(f"{ERP_BASE}/StudeHome.aspx", timeout=10)
         log.info(f"StudeHome → {r2.status_code} | url={r2.url}")
         log.info(f"StudeHome body: {r2.text[:2000]}")
 
-        soup = BeautifulSoup(r2.text, "html.parser")
+        soup   = BeautifulSoup(r2.text, "html.parser")
         tables = soup.find_all("table")
         log.info(f"Tables found: {len(tables)}")
 
-        for i, t in enumerate(tables):
+        for i, t in enumerate(tables[:5]):
             for row in t.find_all("tr")[:4]:
                 cols = [td.get_text(strip=True) for td in row.find_all("td")]
                 if cols:
@@ -166,6 +232,7 @@ def fetch_attendance(session):
     except Exception as e:
         log.error(f"fetch_attendance error: {e}")
         return None, str(e)
+
 
 def scrape_attendance_table(soup):
     results = []
@@ -182,6 +249,7 @@ def scrape_attendance_table(soup):
                     except ValueError:
                         continue
     return results if results else None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MOCK FALLBACK
@@ -207,20 +275,19 @@ def format_mock_attendance():
 def format_real_attendance(data):
     if isinstance(data, dict) and "overall" in data:
         return f"📋 *Attendance Report*\n\n📊 Overall: `{data['overall']}%`"
-
     if isinstance(data, list):
         lines = ["📋 *Attendance Report*\n"]
         for row in data:
             if isinstance(row, list) and len(row) >= 3:
                 lines.append(f"• {' | '.join(str(c) for c in row)}")
             elif isinstance(row, dict):
-                pct = row.get("percent", "?")
+                pct   = row.get("percent", "?")
                 emoji = "✅" if isinstance(pct, (int, float)) and pct >= 75 else "⚠️"
-                lines.append(f"{emoji} *{row.get('subject', 'Subject')}*")
+                lines.append(f"{emoji} *{row.get('subject','Subject')}*")
                 lines.append(f"   {row.get('present','?')}/{row.get('total','?')} — `{pct}%`\n")
         return "\n".join(lines)
-
     return f"📋 Raw:\n`{json.dumps(data, indent=2)}`"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BUNK CALCULATOR
@@ -234,6 +301,7 @@ def bunk_calc(present, total, target=75):
     else:
         needed = int(((target * total) - (100 * present)) / (100 - target)) + 1
         return percent, f"⚠️ Attend *{needed}* more class(es) to reach {target}%."
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TELEGRAM HANDLERS
@@ -269,57 +337,23 @@ async def login_username(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def login_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["password"] = update.message.text.strip()
-    await update.message.reply_text("⏳ Loading ERP login page...")
+    username = ctx.user_data["username"]
+    password = ctx.user_data["password"]
 
-    session, soup, raw_html, err = get_login_page()
+    await update.message.reply_text("⏳ Logging in via ERP (this may take 15–20 seconds)...")
+
+    cookie_dict, err = await erp_login(username, password)
+
     if err:
-        await update.message.reply_text(f"❌ Could not reach ERP: {err}\n\nUse /demo for mock data.")
-        return ConversationHandler.END
-
-    ctx.user_data["erp_session"] = session
-    ctx.user_data["erp_soup"] = soup
-
-    # Try to auto-extract captcha
-    captcha_val = extract_captcha_from_html(soup, raw_html)
-
-    if captcha_val:
-        log.info(f"Auto-extracted captcha: {captcha_val}")
         await update.message.reply_text(
-            f"🔢 Captcha auto-detected: `{captcha_val}`\n⏳ Logging in...",
+            f"❌ Login failed: {err}\n\nTry /login again or use /demo.",
             parse_mode="Markdown"
         )
-        return await _attempt_login(update, ctx, captcha_val)
-    else:
-        # Ask user to manually enter captcha
-        await update.message.reply_text(
-            "🔢 Open https://erp.sgtu.in in your browser and type the *captcha number* shown on the login page:\n\n"
-            "_(Just the digits, e.g. `6186`)_",
-            parse_mode="Markdown"
-        )
-        return CAPTCHA
-
-async def login_captcha(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    captcha_text = "".join(c for c in update.message.text.strip() if c.isdigit())
-    log.info(f"Manual captcha entered: {captcha_text}")
-    return await _attempt_login(update, ctx, captcha_text)
-
-async def _attempt_login(update, ctx, captcha_text):
-    session = ctx.user_data.get("erp_session")
-    soup    = ctx.user_data.get("erp_soup")
-    username = ctx.user_data.get("username")
-    password = ctx.user_data.get("password")
-
-    await update.message.reply_text("⏳ Logging in...")
-
-    success, err = do_login(session, soup, username, password, captcha_text)
-
-    if not success:
-        await update.message.reply_text(f"❌ {err}\n\nTry /login again.")
         return ConversationHandler.END
 
-    sessions[update.effective_user.id] = session
+    user_cookies[update.effective_user.id] = cookie_dict
     await update.message.reply_text(
-        "✅ *Logged in successfully!*\n\nUse /attendance to fetch your data.",
+        "✅ *Logged in successfully!*\n\nUse /attendance to fetch your real data.",
         parse_mode="Markdown"
     )
     return ConversationHandler.END
@@ -329,16 +363,16 @@ async def login_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def attendance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    session = sessions.get(uid)
+    uid     = update.effective_user.id
+    cookies = user_cookies.get(uid)
 
-    if not session:
+    if not cookies:
         await update.message.reply_text("⚠️ Not logged in. Use /login first, or /demo for mock data.")
         return
 
     await update.message.reply_text("⏳ Fetching attendance from ERP...")
 
-    data, err = fetch_attendance(session)
+    data, err = fetch_attendance(cookies)
 
     if err or not data:
         await update.message.reply_text(
@@ -370,9 +404,10 @@ async def bunk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Numbers only. Example: `/bunk 35 45`", parse_mode="Markdown")
 
 async def logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    sessions.pop(update.effective_user.id, None)
+    user_cookies.pop(update.effective_user.id, None)
     ctx.user_data.clear()
     await update.message.reply_text("✅ Logged out.")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
@@ -386,7 +421,6 @@ def main():
         states={
             USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_username)],
             PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_password)],
-            CAPTCHA:  [MessageHandler(filters.TEXT & ~filters.COMMAND, login_captcha)],
         },
         fallbacks=[CommandHandler("cancel", login_cancel)],
     )
