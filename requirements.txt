@@ -2,6 +2,6 @@ python-telegram-bot==21.3
 requests
 beautifulsoup4
 playwright
-Pillow
+Pillow==10.3.0
 pytesseract
 cryptography
