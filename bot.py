@@ -8,9 +8,9 @@ import json
 import logging
 import requests
 from bs4 import BeautifulSoup
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardRemove
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
+    ApplicationBuilder, CommandHandler, MessageHandler,
     ConversationHandler, ContextTypes, filters
 )
 
@@ -437,7 +437,7 @@ async def logout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     login_conv = ConversationHandler(
         entry_points=[CommandHandler("login", login_start)],
