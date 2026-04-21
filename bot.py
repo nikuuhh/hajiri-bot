@@ -9,9 +9,11 @@ Architecture:
 """
 
 import os
+import sys
 import json
 import logging
 import asyncio
+import subprocess
 import requests
 from io import BytesIO
 from PIL import Image, ImageFilter, ImageOps
@@ -29,6 +31,29 @@ logging.basicConfig(
     level=logging.INFO
 )
 log = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INSTALL PLAYWRIGHT BROWSER AT STARTUP
+# This ensures the Chromium binary is always present regardless of build cache
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ensure_playwright_browser():
+    log.info("Ensuring Playwright Chromium is installed...")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode == 0:
+            log.info("Playwright Chromium ready.")
+        else:
+            log.warning(f"playwright install stderr: {result.stderr[:300]}")
+    except Exception as e:
+        log.error(f"Could not install Playwright browser: {e}")
+
+ensure_playwright_browser()
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 BOT_TOKEN   = os.environ["BOT_TOKEN"]
 ENCRYPT_KEY = os.environ.get("ENCRYPT_KEY", "")
@@ -292,8 +317,6 @@ async def full_login(username: str, password: str) -> tuple[requests.Session | N
             return session, None
 
         log.warning(f"Login failed ({err}) attempt {attempt}")
-
-        # Wrong creds — no point retrying captcha
         if err and any(w in err.lower() for w in ["invalid", "wrong", "incorrect"]):
             return None, err
 
