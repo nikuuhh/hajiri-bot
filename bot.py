@@ -40,18 +40,9 @@ def get_login_page():
         r = s.get(f"{ERP_BASE}/Default.aspx", timeout=10)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-
-        # Log everything useful for debugging
-        all_imgs = [(i.get("id",""), i.get("src","")) for i in soup.find_all("img")]
-        log.info(f"IMG tags: {all_imgs}")
-
-        all_inputs = [(i.get("name",""), i.get("id",""), i.get("type",""), i.get("value","")[:20])
-                      for i in soup.find_all("input")]
-        log.info(f"INPUT tags: {all_inputs}")
-
-        return s, soup, None
+        return s, soup, r.text, None
     except Exception as e:
-        return None, None, str(e)
+        return None, None, None, str(e)
 
 
 def extract_aspnet_fields(soup):
@@ -62,53 +53,60 @@ def extract_aspnet_fields(soup):
     return fields
 
 
-def get_captcha_image(session, soup):
+def extract_captcha_from_html(soup, raw_html):
     """
-    Find captcha image by scanning ALL img tags for anything captcha-related.
-    Returns (image_bytes, captcha_input_field_name, error).
+    The SGT ERP captcha is plain styled text in the HTML — not an image.
+    From screenshot: numbers like '6 1 8 6' displayed next to a refresh icon.
+    We try multiple strategies to extract it.
     """
-    all_imgs = soup.find_all("img")
 
-    for img in all_imgs:
-        src = img.get("src", "")
-        img_id = (img.get("id") or "").lower()
-        src_lower = src.lower()
+    # Strategy 1: hdncaptcha hidden field may already contain the value
+    cap_field = soup.find("input", {"name": "hdncaptcha"})
+    if cap_field:
+        val = cap_field.get("value", "").strip()
+        if val and val.isdigit():
+            log.info(f"Captcha from hdncaptcha field: {val}")
+            return val
 
-        # Match by ID or src containing captcha-related keywords
-        if any(x in img_id for x in ["captcha", "cap", "verify", "code"]) or \
-           any(x in src_lower for x in ["captcha", "cap", "verify", "rand", "code", "image"]):
+    # Strategy 2: Look for a label/span/div with short numeric text
+    for tag in soup.find_all(["label", "span", "div", "td", "p", "h4", "h5", "strong", "b"]):
+        text = tag.get_text(strip=True).replace(" ", "")
+        if text.isdigit() and 3 <= len(text) <= 8:
+            log.info(f"Captcha from <{tag.name}> id={tag.get('id')}: {text}")
+            return text
 
-            log.info(f"Found captcha img: id={img.get('id')} src={src}")
+    # Strategy 3: Scan raw HTML for patterns like value="1234" near captcha
+    import re
+    # Find captcha-related section and grab nearby numbers
+    lower = raw_html.lower()
+    cap_idx = lower.find("captcha")
+    if cap_idx > 0:
+        chunk = raw_html[max(0, cap_idx-300):cap_idx+500]
+        log.info(f"HTML around 'captcha': {chunk}")
+        # Look for 4-digit number in that chunk
+        matches = re.findall(r'\b(\d{4,6})\b', chunk)
+        if matches:
+            log.info(f"Captcha candidates near 'captcha' keyword: {matches}")
+            return matches[0]
 
-            if not src.startswith("http"):
-                src = ERP_BASE + "/" + src.lstrip("/")
-            try:
-                r = session.get(src, timeout=10)
-                if len(r.content) > 100:  # valid image
-                    return r.content, None
-            except Exception as e:
-                log.warning(f"Failed to fetch captcha img: {e}")
+    # Strategy 4: Any 4-digit number in the whole page
+    matches = re.findall(r'\b(\d{4})\b', raw_html)
+    # Filter out years and common numbers
+    candidates = [m for m in matches if not m.startswith("20") and m not in ["1000","2000","9999"]]
+    if candidates:
+        log.info(f"Fallback captcha candidates: {candidates[:5]}")
+        # Return most frequent one (likely the captcha repeated in hidden field)
+        from collections import Counter
+        most_common = Counter(candidates).most_common(1)[0][0]
+        return most_common
 
-    # Base64 inline captcha
-    for img in all_imgs:
-        src = img.get("src", "")
-        if src.startswith("data:image"):
-            log.info("Found base64 captcha")
-            import base64
-            try:
-                b64 = src.split(",")[1]
-                return base64.b64decode(b64), None
-            except Exception as e:
-                log.warning(f"Base64 decode failed: {e}")
-
-    log.warning("No captcha image found in page")
-    return None, "not found"
+    log.warning("Could not extract captcha from HTML")
+    return None
 
 
 def do_login(session, soup, username, password, captcha_text):
     fields = extract_aspnet_fields(soup)
 
-    # Confirmed SGT ERP hidden fields
     fields["hdnusername"] = username
     fields["hdnpassword"] = password
     if captcha_text:
@@ -138,9 +136,8 @@ def do_login(session, soup, username, password, captcha_text):
     if btn and btn.get("name"):
         fields[btn["name"]] = btn.get("value", "Login")
 
-    # Log what we're sending (hide viewstate noise)
     safe = {k: v for k, v in fields.items() if "STATE" not in k.upper()}
-    log.info(f"POSTing fields: {safe}")
+    log.info(f"POSTing: {safe}")
 
     try:
         r = session.post(
@@ -149,15 +146,14 @@ def do_login(session, soup, username, password, captcha_text):
             timeout=15,
             allow_redirects=True
         )
-        log.info(f"Login POST → status={r.status_code} url={r.url}")
-        log.info(f"Login response body: {r.text[:800]}")
+        log.info(f"Login → status={r.status_code} url={r.url}")
+        log.info(f"Login response: {r.text[:600]}")
 
         if "StudeHome" in r.url:
             return True, None
         if "Default.aspx" in r.url:
             return False, "Wrong credentials or captcha."
-        log.warning(f"Unknown redirect: {r.url}")
-        return False, f"Unknown redirect: {r.url}"
+        return False, f"Unexpected redirect: {r.url}"
 
     except Exception as e:
         return False, str(e)
@@ -183,21 +179,18 @@ def fetch_attendance(session):
         except Exception:
             log.warning("ShowAttPer not JSON")
 
-        # Scrape dashboard page
         r2 = session.get(f"{ERP_BASE}/StudeHome.aspx", timeout=10)
         log.info(f"StudeHome → {r2.status_code} | url={r2.url}")
         log.info(f"StudeHome body: {r2.text[:2000]}")
 
         soup = BeautifulSoup(r2.text, "html.parser")
         tables = soup.find_all("table")
-        log.info(f"Tables on dashboard: {len(tables)}")
+        log.info(f"Tables: {len(tables)}")
         for i, t in enumerate(tables):
-            rows = t.find_all("tr")
-            log.info(f"  Table {i}: {len(rows)} rows")
-            for row in rows[:4]:
+            for row in t.find_all("tr")[:4]:
                 cols = [td.get_text(strip=True) for td in row.find_all("td")]
                 if cols:
-                    log.info(f"    {cols}")
+                    log.info(f"  T{i}: {cols}")
 
         rows = scrape_attendance_table(soup)
         if rows:
@@ -315,7 +308,7 @@ async def login_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["password"] = update.message.text.strip()
     await update.message.reply_text("⏳ Loading ERP login page...")
 
-    session, soup, err = get_login_page()
+    session, soup, raw_html, err = get_login_page()
     if err:
         await update.message.reply_text(f"❌ Could not reach ERP: {err}\n\nUse /demo for mock data.")
         return ConversationHandler.END
@@ -323,28 +316,24 @@ async def login_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["erp_session"] = session
     ctx.user_data["erp_soup"]    = soup
 
-    # ALWAYS try to get captcha — never skip it
-    cap_bytes, cap_err = get_captcha_image(session, soup)
+    # Try to auto-extract captcha from HTML
+    captcha_val = extract_captcha_from_html(soup, raw_html)
 
-    if not cap_bytes:
-        # No captcha image found — try login directly but warn
-        log.warning(f"No captcha image found: {cap_err}. Attempting login anyway.")
-        await update.message.reply_text("⚠️ Could not load captcha image. Attempting login without it...")
-        return await _attempt_login(update, ctx, captcha_text="")
-
-    # Send captcha image to Telegram user
-    await update.message.reply_photo(
-        photo=cap_bytes,
-        caption="🔢 Type the *numbers* shown in the image:",
-        parse_mode="Markdown"
-    )
-    return CAPTCHA
+    if captcha_val:
+        log.info(f"Auto-extracted captcha: {captcha_val}")
+        await update.message.reply_text(f"🔢 Captcha detected: `{captcha_val}`\n⏳ Logging in...", parse_mode="Markdown")
+        return await _attempt_login(update, ctx, captcha_val)
+    else:
+        # Could not auto-extract — ask user manually
+        await update.message.reply_text(
+            "🔢 Please open https://erp.sgtu.in and type the *captcha number* shown on the login page:",
+            parse_mode="Markdown"
+        )
+        return CAPTCHA
 
 async def login_captcha(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    captcha_text = update.message.text.strip()
-    # Strip any non-digits just in case
-    captcha_text = "".join(c for c in captcha_text if c.isdigit())
-    log.info(f"User entered captcha: {captcha_text}")
+    captcha_text = "".join(c for c in update.message.text.strip() if c.isdigit())
+    log.info(f"Manual captcha entered: {captcha_text}")
     return await _attempt_login(update, ctx, captcha_text)
 
 async def _attempt_login(update, ctx, captcha_text):
@@ -357,9 +346,7 @@ async def _attempt_login(update, ctx, captcha_text):
     success, err = do_login(session, soup, username, password, captcha_text)
 
     if not success:
-        await update.message.reply_text(
-            f"❌ {err}\n\nTry /login again."
-        )
+        await update.message.reply_text(f"❌ {err}\n\nTry /login again.")
         return ConversationHandler.END
 
     sessions[update.effective_user.id] = session
