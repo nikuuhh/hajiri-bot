@@ -58,7 +58,16 @@ def extract_aspnet_fields(soup):
 
 
 def get_captcha_image(session, soup):
-    for possible_id in ["imgCaptcha", "CaptchaImage", "imgcaptcha", "img_captcha"]:
+    # Log ALL img tags to find captcha
+    all_imgs = soup.find_all("img")
+    log.info(f"All img tags on login page: {[(i.get('id'), i.get('src')) for i in all_imgs]}")
+
+    # Log ALL input fields (hidden + visible) for debugging
+    all_inputs = soup.find_all("input")
+    log.info(f"All inputs: {[(i.get('name'), i.get('id'), i.get('type'), i.get('value','')[:30]) for i in all_inputs]}")
+
+    for possible_id in ["imgCaptcha", "CaptchaImage", "imgcaptcha", "img_captcha",
+                        "Image1", "imgcap", "captchaImg"]:
         img_tag = soup.find("img", {"id": possible_id})
         if img_tag:
             src = img_tag.get("src", "")
