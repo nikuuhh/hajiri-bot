@@ -1,5 +1,27 @@
 [phases.setup]
-nixPkgs = ["chromium", "nss", "nspr", "atk", "cups", "dbus", "libdrm", "gtk3", "pango", "cairo", "xorg.libX11", "xorg.libXcomposite", "xorg.libXdamage", "xorg.libXext", "xorg.libXfixes", "xorg.libXrandr", "xorg.libxcb", "mesa"]
+nixPkgs = [
+  "chromium",
+  "tesseract",
+  "nss",
+  "nspr",
+  "atk",
+  "cups",
+  "libdrm",
+  "dbus",
+  "libxkbcommon",
+  "xorg.libX11",
+  "xorg.libXcomposite",
+  "xorg.libXdamage",
+  "xorg.libXext",
+  "xorg.libXfixes",
+  "xorg.libXrandr",
+  "mesa",
+  "expat",
+  "xorg.libxcb",
+  "pango",
+  "cairo",
+  "alsa-lib"
+]
 
 [phases.install]
 cmds = [
