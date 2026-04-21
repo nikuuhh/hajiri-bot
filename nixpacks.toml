@@ -2,6 +2,14 @@
 nixPkgs = [
   "chromium",
   "tesseract",
+  "zlib",
+  "libjpeg",
+  "libpng",
+  "libtiff",
+  "libwebp",
+  "freetype",
+  "lcms2",
+  "openjpeg",
   "nss",
   "nspr",
   "atk",
@@ -25,7 +33,9 @@ nixPkgs = [
 
 [phases.install]
 cmds = [
-  "pip install -r requirements.txt",
+  "pip install --upgrade pip",
+  "pip install python-telegram-bot==21.3 requests beautifulsoup4 cryptography pytesseract playwright",
+  "pip install Pillow --no-cache-dir",
   "playwright install chromium"
 ]
 
