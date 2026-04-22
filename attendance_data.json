@@ -1,0 +1,14 @@
+{
+  "students": {
+    "default": {
+      "name": "Student",
+      "subjects": [
+        {"subject": "Mathematics",       "present": 38, "total": 45},
+        {"subject": "Physics",           "present": 30, "total": 40},
+        {"subject": "Chemistry",         "present": 35, "total": 42},
+        {"subject": "English",           "present": 28, "total": 38},
+        {"subject": "Computer Science",  "present": 42, "total": 46}
+      ]
+    }
+  }
+}
