@@ -83,29 +83,72 @@ def format_attendance(data: dict, rollno: str, session: dict = None) -> str:
     return "\n".join(lines)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ANNOUNCEMENTS — Mock data (replace with live channel fetch when ready)
+# ─────────────────────────────────────────────────────────────────────────────
+
+MOCK_ANNOUNCEMENTS = [
+    {
+        "id": 1,
+        "date": "22 Apr 2026",
+        "tag": "🚨 URGENT",
+        "title": "Fee Payment Notice",
+        "body": (
+            "All students of *3rd, 5th & 7th Semester* must clear their pending fees "
+            "immediately to avoid de-registration. Visit the accounts office or pay "
+            "via the ERP portal before the deadline. Non-payment will result in "
+            "restricted access to exams and attendance portal."
+        ),
+    },
+    {
+        "id": 2,
+        "date": "20 Apr 2026",
+        "tag": "📋 EXAM",
+        "title": "Regular Exam Form Submission",
+        "body": (
+            "All students are required to submit the *Regular Exam Form* as per the "
+            "attached notification *without delay.*\n\n"
+            "📌 *Submit through:* ERP Portal _(Mastersoft)_\n"
+            "Ensure all details are filled correctly. Late submissions will not be accepted."
+        ),
+    },
+    {
+        "id": 3,
+        "date": "10 Apr 2026",
+        "tag": "🎬 EVENT",
+        "title": "Special Event — Bhoot Bangla Film Promotion",
+        "body": (
+            "A special event for the film promotion by the star cast of *Bhoot Bangla* "
+            "is scheduled for *10 April 2026* at the university premises.\n\n"
+            "📌 *Guidelines:*\n"
+            "• Students must carry and display their valid *University ID card*\n"
+            "• Students must be in proper *prescribed uniform*\n"
+            "• No student will be permitted to enter without a valid ID card and appropriate uniform"
+        ),
+    },
+]
+
+
 def get_announcements() -> str:
     """
-    TODO: Replace with real Telegram channel fetch.
-    To enable: make the bot an admin of COLLEGE_CHANNEL, then use
-    bot.get_chat() / forwardMessages API to pull the last 3 days of posts.
+    Returns formatted announcements string for Telegram.
+    Mock data — replace with live Telegram channel fetch when COLLEGE_CHANNEL is configured.
     """
-    today = datetime.now()
-    days  = [(today - timedelta(days=i)).strftime("%d %b %Y") for i in range(3)]
     lines = [
-        "📢 *Announcements — Last 3 Days*",
-        f"_(from {COLLEGE_CHANNEL})_",
+        "📢 *Announcements*",
+        f"_(SGT University — {datetime.now().strftime('%d %b %Y')})_",
         "",
-        f"📅 *{days[0]}*",
-        "• No announcements fetched yet.",
-        "",
-        f"📅 *{days[1]}*",
-        "• Connect the bot to the college channel to see real posts.",
-        "",
-        f"📅 *{days[2]}*",
-        "• Set COLLEGE\\_CHANNEL in bot.py to activate this feature.",
-        "",
-        "_To enable: add the bot as admin to the channel and update COLLEGE\\_CHANNEL._",
     ]
+
+    for ann in MOCK_ANNOUNCEMENTS:
+        lines.append(f"{ann['tag']} | {ann['date']}")
+        lines.append(f"*{ann['title']}*")
+        lines.append(ann["body"])
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("")
+
+    lines.append("_Source: SGT University Official_")
     return "\n".join(lines)
 
 
