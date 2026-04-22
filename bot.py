@@ -27,7 +27,7 @@ DATA_FILE = os.path.join(os.path.dirname(__file__), "attendance_data.json")
 COLLEGE_CHANNEL = "@your_college_channel"
 
 ROLLNO, PASSWORD = range(2)
-sessions = {}  # { user_id: { "rollno": str, "name": str } }
+sessions = {}  # { user_id: { "rollno": str, "name": str, "course": str } }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -52,13 +52,25 @@ def bunk_calc(present: int, total: int, target: int = 75):
     return percent, msg
 
 
-def format_attendance(data: dict, rollno: str) -> str:
+def format_attendance(data: dict, rollno: str, session: dict = None) -> str:
     subjects = data.get("subjects", [])
     total_present = sum(s["present"] for s in subjects)
     total_classes = sum(s["total"] for s in subjects)
     overall_pct   = round(total_present / total_classes * 100, 2) if total_classes else 0.0
 
-    lines = ["HAJIRI", "", "*Attendance Summary:*"]
+    name   = (session or {}).get("name",   data.get("name",   rollno))
+    course = (session or {}).get("course", data.get("course", ""))
+
+    lines = [
+        "HAJIRI",
+        "",
+        f"👤 *{name}*",
+        f"📚 {course}",
+        f"🎫 Roll No: `{rollno}`",
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "*Attendance Summary:*",
+    ]
     for s in subjects:
         pct, bunk_msg = bunk_calc(s["present"], s["total"])
         lines.append(f"\n*{s['subject']}*")
@@ -154,13 +166,17 @@ async def login_rollno(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def login_password(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rollno  = ctx.user_data.get("rollno", "unknown")
     student = load_student_data(rollno)
-    name    = student.get("name", rollno) if student else rollno
+    name    = student.get("name",   rollno)  if student else rollno
+    course  = student.get("course", "")      if student else ""
 
-    sessions[update.effective_user.id] = {"rollno": rollno, "name": name}
+    sessions[update.effective_user.id] = {"rollno": rollno, "name": name, "course": course}
     ctx.user_data.clear()
 
     await update.message.reply_text(
-        f"✅ *Logged in!*\n\nHello, *{name}* (`{rollno}`)\n\nWhat do you need?",
+        f"✅ *Welcome, {name}!*\n\n"
+        f"📚 {course}\n"
+        f"🎫 Roll No: `{rollno}`\n\n"
+        f"What do you need?",
         parse_mode="Markdown",
         reply_markup=main_menu()
     )
@@ -199,7 +215,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("❌ No attendance data found for your roll number.")
             return
         await query.message.reply_text(
-            format_attendance(student, session["rollno"]),
+            format_attendance(student, session["rollno"], session),
             parse_mode="Markdown",
             reply_markup=back_menu()
         )
@@ -235,7 +251,7 @@ async def attendance_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No attendance data found.")
         return
     await update.message.reply_text(
-        format_attendance(student, session["rollno"]),
+        format_attendance(student, session["rollno"], session),
         parse_mode="Markdown",
         reply_markup=back_menu()
     )
